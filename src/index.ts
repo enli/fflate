@@ -235,7 +235,7 @@ const err = (ind: number, msg?: string | 0, nt?: 1) => {
 }
 
 // expands raw DEFLATE data
-const inflt = (dat: Uint8Array, buf?: Uint8Array, st?: InflateState) => {
+const inflt = (dat: Uint8Array, buf?: Uint8Array, st?: InflateState, shouldIgnoreInflateErrors?: boolean) => {
   // source length
   const sl = dat.length;
   if (!sl || (st && st.f && !st.l)) return buf || new u8(0);
@@ -272,7 +272,11 @@ const inflt = (dat: Uint8Array, buf?: Uint8Array, st?: InflateState) => {
         // go to end of byte boundary
         const s = shft(pos) + 4, l = dat[s - 4] | (dat[s - 3] << 8), t = s + l;
         if (t > sl) {
-          if (noSt) err(0);
+          if (shouldIgnoreInflateErrors) {
+            console.warn('Detected unexpected EOF but ignoring it because config was set to do so');
+          } else {
+            err(0);
+          }
           break;
         }
         // ensure size
@@ -328,7 +332,11 @@ const inflt = (dat: Uint8Array, buf?: Uint8Array, st?: InflateState) => {
         dbt = max(dt);
         lm = hMap(lt, lbt, 1);
         dm = hMap(dt, dbt, 1);
-      } else err(1);
+      } else if (shouldIgnoreInflateErrors) {
+        console.warn('Detected invalid block type error but ignoring it because config was set to do so');
+      } else {
+        err(1);
+      }
       if (pos > tbts) {
         if (noSt) err(0);
         break;
@@ -341,13 +349,30 @@ const inflt = (dat: Uint8Array, buf?: Uint8Array, st?: InflateState) => {
     let lpos = pos;
     for (;; lpos = pos) {
       // bits read, code
+      if (!lm && shouldIgnoreInflateErrors) {
+        console.warn('Detected unexpected error but ignoring it because config was set to do so');
+        break;
+      }
       const c = lm[bits16(dat, pos) & lms], sym = c >>> 4;
       pos += c & 15;
       if (pos > tbts) {
-        if (noSt) err(0);
+        if (noSt) {
+          if (shouldIgnoreInflateErrors) {
+            console.warn('Detected invalid length/literal error but ignoring it because config was set to do so');
+          } else {
+            err(0);
+          }
+        }
         break;
       }
-      if (!c) err(2);
+      if (!c) {
+        if (shouldIgnoreInflateErrors) {
+          console.warn('Detected invalid length/literal error but ignoring it because config was set to do so');
+          break;
+        } else {
+          err(2);
+        }
+      }
       if (sym < 256) buf[bt++] = sym;
       else if (sym == 256) {
         lpos = pos, lm = null;
@@ -363,7 +388,14 @@ const inflt = (dat: Uint8Array, buf?: Uint8Array, st?: InflateState) => {
         }
         // dist
         const d = dm[bits16(dat, pos) & dms], dsym = d >>> 4;
-        if (!d) err(3);
+        if (!d) {
+          if (shouldIgnoreInflateErrors) {
+            console.warn('Detected invalid distance error but ignoring it because config was set to do so');
+            break;
+          } else {
+            err(3);
+          }
+        }
         pos += d & 15;
         let dt = fd[dsym];
         if (dsym > 3) {
@@ -371,7 +403,13 @@ const inflt = (dat: Uint8Array, buf?: Uint8Array, st?: InflateState) => {
           dt += bits16(dat, pos) & ((1 << b) - 1), pos += b;
         }
         if (pos > tbts) {
-          if (noSt) err(0);
+          if (noSt) {
+            if (shouldIgnoreInflateErrors) {
+              console.warn('Detected unexpected EOF error but ignoring it because config was set to do so');
+            } else {
+              err(0);
+            }
+          }
           break;
         }
         if (noBuf) cbuf(bt + 131072);
@@ -874,6 +912,9 @@ export interface AsyncInflateOptions extends AsyncOptions {
    * size in bytes and be given back a new typed array.
    */
   size?: number;
+
+  /** whether to ignore errors and still proceed with inflation. */
+  shouldIgnoreInvalidEOF?: boolean;
 }
 
 /**
@@ -1251,6 +1292,7 @@ export class Inflate {
   private o: Uint8Array;
   private p = new u8(0);
   private d: boolean;
+  private ign: boolean;
   /**
    * The handler to call whenever data is available
    */
@@ -1267,7 +1309,7 @@ export class Inflate {
   private c(final: boolean) {
     this.d = this.s.i = final || false;
     const bts = this.s.b;
-    const dt = inflt(this.p, this.o, this.s);
+    const dt = inflt(this.p, this.o, this.s, this.ign);
     this.ondata(slc(dt, bts, this.s.b), this.d);
     this.o = slc(dt, this.s.b - 32768), this.s.b = this.o.length;
     this.p = slc(this.p, (this.s.p / 8) | 0), this.s.p &= 7;
@@ -1349,10 +1391,11 @@ export function inflate(data: Uint8Array, opts: AsyncInflateOptions | FlateCallb
  * Expands DEFLATE data with no wrapper
  * @param data The data to decompress
  * @param out Where to write the data. Saves memory if you know the decompressed size and provide an output buffer of that length.
+ * @param shouldIgnoreInflateErrors whether to ignore errors and still proceed with inflation.
  * @returns The decompressed version of the data
  */
-export function inflateSync(data: Uint8Array, out?: Uint8Array) {
-  return inflt(data, out);
+export function inflateSync(data: Uint8Array, out?: Uint8Array, shouldIgnoreInflateErrors?: boolean) {
+  return inflt(data, out, null, shouldIgnoreInflateErrors);
 }
 
 // before you yell at me for not just using extends, my reason is that TS inheritance is hard to workerize.
@@ -1597,10 +1640,11 @@ export function gunzip(data: Uint8Array, opts: AsyncGunzipOptions | FlateCallbac
  * Expands GZIP data
  * @param data The data to decompress
  * @param out Where to write the data. GZIP already encodes the output size, so providing this doesn't save memory.
+ * @param shouldIgnoreInflateErrors whether to ignore errors and still proceed with inflation.
  * @returns The decompressed version of the data
  */
-export function gunzipSync(data: Uint8Array, out?: Uint8Array) {
-  return inflt(data.subarray(gzs(data), -8), out || new u8(gzl(data)));
+export function gunzipSync(data: Uint8Array, out?: Uint8Array, shouldIgnoreInflateErrors?: boolean) {
+  return inflt(data.subarray(gzs(data), -8), out || new u8(gzl(data)), null, shouldIgnoreInflateErrors);
 }
 
 /**
@@ -1838,10 +1882,11 @@ export function unzlib(data: Uint8Array, opts: AsyncGunzipOptions | FlateCallbac
  * Expands Zlib data
  * @param data The data to decompress
  * @param out Where to write the data. Saves memory if you know the decompressed size and provide an output buffer of that length.
+ * @param shouldIgnoreInflateErrors whether to ignore errors and still proceed with inflation.
  * @returns The decompressed version of the data
  */
-export function unzlibSync(data: Uint8Array, out?: Uint8Array) {
-  return inflt((zlv(data), data.subarray(2, -4)), out);
+export function unzlibSync(data: Uint8Array, out?: Uint8Array, shouldIgnoreInflateErrors?: boolean) {
+  return inflt((zlv(data), data.subarray(2, -4)), out, null, shouldIgnoreInflateErrors);
 }
 
 // Default algorithm for compression (used because having a known output size allows faster decompression)
@@ -1952,14 +1997,15 @@ export function decompress(data: Uint8Array, opts: AsyncInflateOptions | FlateCa
  * Expands compressed GZIP, Zlib, or raw DEFLATE data, automatically detecting the format
  * @param data The data to decompress
  * @param out Where to write the data. Saves memory if you know the decompressed size and provide an output buffer of that length.
+ * @param shouldIgnoreInflateErrors whether to ignore errors and still proceed with inflation.
  * @returns The decompressed version of the data
  */
-export function decompressSync(data: Uint8Array, out?: Uint8Array) {
+export function decompressSync(data: Uint8Array, out?: Uint8Array, shouldIgnoreInflateErrors?: boolean) {
   return (data[0] == 31 && data[1] == 139 && data[2] == 8)
     ? gunzipSync(data, out)
     : ((data[0] & 15) != 8 || (data[0] >> 4) > 7 || ((data[0] << 8 | data[1]) % 31))
-      ? inflateSync(data, out)
-      : unzlibSync(data, out);
+      ? inflateSync(data, out, shouldIgnoreInflateErrors)
+      : unzlibSync(data, out, shouldIgnoreInflateErrors);
 }
 
 /**
